@@ -420,7 +420,11 @@ QImage NexusBuilder::extractNodeTex(TMesh &mesh, int level, float &error, float 
 	}
 
 	{
-		QMutexLocker locker(&m_atlas);
+		//NOTE: the global m_atlas lock used to wrap this whole loop, serializing every
+		//node's texture read (and its JPEG decode) across all worker threads. It has been
+		//removed: `image`/`painter` are node-local, and TexAtlas::read/getImg are now
+		//internally thread-safe (fine-grained cache_lock) with the expensive JPEG decode
+		//happening outside that lock, so decodes now run concurrently.
 		//	static int boxid = 0;
 		QPainter painter(&image);
 		//convert tex coordinates using mapping
@@ -606,7 +610,7 @@ void NexusBuilder::processBlock(KDTreeSoup *input, StreamSoup *output, uint bloc
 		if(tmp.vert.size() > 60000) {
 			cerr << "Unable to properly simplify due to fragmented parametrization\n"
 				 << "Try to reduce the size of the nodes using -f (default is 32768)" << endl;
-			exit(0);
+			exit(1); // TODO: or some other value
 		}
 
 		//save node in nexus temporary structure

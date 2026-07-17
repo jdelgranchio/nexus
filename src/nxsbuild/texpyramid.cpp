@@ -242,26 +242,77 @@ QImage TexAtlas::read(int tex, int level, QRect region) {
 
 void TexAtlas::addImg(Index index, QImage img) {
 	//cout << "Adding: tex: " << index.tex << " level: " << index.level << " index: " << index.index << endl;
-	cache_size += img.width()*img.height()*4;
-	ram[index] = RamData(img, access++);
-	pruneCache();
+	QMutexLocker locker(&cache_lock);
+	addImgLocked(index, img);
+}
+
+//assumes cache_lock is held
+void TexAtlas::addImgLocked(Index index, const QImage &img) {
+	auto existing = ram.find(index);
+	if(existing != ram.end()) {
+		//already cached (e.g. another worker decoded it concurrently): refresh in place
+		cache_size -= 4ull*existing->second.image.width()*existing->second.image.height();
+		cache_size += 4ull*img.width()*img.height();
+		existing->second.image = img;
+		lru_list.splice(lru_list.begin(), lru_list, existing->second.lru);
+		pruneCacheLocked();
+		return;
+	}
+	cache_size += 4ull*img.width()*img.height();
+	lru_list.push_front(index);
+	RamData d(img);
+	d.lru = lru_list.begin();
+	ram[index] = d;
+	pruneCacheLocked();
 }
 
 QImage TexAtlas::getImg(Index index) {
-	auto it = ram.find(index);
-	if(it != ram.end())
-		return it->second.image;
+	{
+		QMutexLocker locker(&cache_lock);
+		auto it = ram.find(index);
+		if(it != ram.end()) {
+			//mark most-recently-used
+			lru_list.splice(lru_list.begin(), lru_list, it->second.lru);
+			return it->second.image; //QImage is implicitly shared: cheap, and safe to read concurrently
+		}
+	}
 
-	auto dt = disk.find(index);
-	if(dt == disk.end())
-		throw QString("unespected missing image in disk and ram");
+	//Cache miss: pull the compressed bytes out of the temp store under the lock
+	//(QFile is not thread-safe), then do the expensive JPEG decode OUTSIDE the lock
+	//so multiple worker threads can decode different tiles in parallel.
+	DiskData d;
+	QByteArray bytes;
+	{
+		QMutexLocker locker(&cache_lock);
+		auto it = ram.find(index);              //re-check: another thread may have loaded it
+		if(it != ram.end()) {
+			lru_list.splice(lru_list.begin(), lru_list, it->second.lru);
+			return it->second.image;
+		}
+		auto dt = disk.find(index);
+		if(dt == disk.end())
+			throw QString("unespected missing image in disk and ram");
+		d = dt->second;
+		uchar *data = storage.map(d.offset, d.size);
+		if(!data)
+			throw QString("failed mapping texture storage");
+		bytes = QByteArray(reinterpret_cast<const char *>(data), int(d.size));
+		storage.unmap(data);
+	}
 
-	QImage img(dt->second.w, dt->second.h, QImage::Format_RGB32);
-	uchar *data = storage.map(dt->second.offset, dt->second.size);
-	img.loadFromData(data, dt->second.size);
-	storage.unmap(data);
-	addImg(index, img);
-	return img;
+	QImage img(d.w, d.h, QImage::Format_RGB32);
+	img.loadFromData(bytes);                    //<-- JPEG decode, now concurrent
+
+	{
+		QMutexLocker locker(&cache_lock);
+		auto it = ram.find(index);              //another thread may have won the race meanwhile
+		if(it != ram.end()) {
+			lru_list.splice(lru_list.begin(), lru_list, it->second.lru);
+			return it->second.image;
+		}
+		addImgLocked(index, img);
+		return img;
+	}
 }
 
 
@@ -274,9 +325,11 @@ void TexAtlas::buildLevel(int level) {
 
 //do not store it in temporary file, we are throwing away this level.
 void TexAtlas::flush(int level) {
+	QMutexLocker locker(&cache_lock);
 	for (auto it = ram.cbegin(); it != ram.cend();) {
 		if (it->first.level == level) {
-			cache_size -= 4*(it->second.image.width())*(it->second.image.height());
+			cache_size -= 4ull*(it->second.image.width())*(it->second.image.height());
+			lru_list.erase(it->second.lru);
 			it = ram.erase(it);
 		} else
 			++it;
@@ -284,17 +337,20 @@ void TexAtlas::flush(int level) {
 }
 
 void TexAtlas::pruneCache() {
-	while(cache_size > cache_max) {
-		Index index;
-		uint32_t oldest = access;
-		for (auto it = ram.cbegin(); it != ram.cend(); it++) {
-			if(it->second.access < oldest) {
-				index = it->first;
-				oldest = it->second.access;
-			}
-		}
+	QMutexLocker locker(&cache_lock);
+	pruneCacheLocked();
+}
+
+//assumes cache_lock is held. O(1) eviction using the intrusive LRU list.
+void TexAtlas::pruneCacheLocked() {
+	while(cache_size > cache_max && !lru_list.empty()) {
+		Index index = lru_list.back();
 		auto it = ram.find(index);
-		cache_size -= 4*(it->second.image.width())*(it->second.image.height());
+		if(it == ram.end()) {          //should not happen, keep list consistent
+			lru_list.pop_back();
+			continue;
+		}
+		cache_size -= 4ull*(it->second.image.width())*(it->second.image.height());
 		if(disk.find(index) == disk.end()) {
 			DiskData d;
 			d.offset = storage.pos();
@@ -305,6 +361,7 @@ void TexAtlas::pruneCache() {
 			disk[index] = d;
 		}
 		ram.erase(it);
+		lru_list.pop_back();
 	}
 }
 
