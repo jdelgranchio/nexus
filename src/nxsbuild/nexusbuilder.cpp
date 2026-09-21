@@ -335,9 +335,10 @@ QImage NexusBuilder::extractNodeTex(TMesh &mesh, int level, float &error, float 
 			break;
 	}
 	if(!success) {
-		cerr << "Failed packing: the texture in a single nexus node would be > 16K\n";
-		cerr << "Try to reduce the size of the nodes using -t (default is 4096)";
-		exit(0);
+		if(!abort_requested.exchange(true))
+			abort_message = "Failed packing: the texture in a single nexus node would be > 16K\n"
+							"Try to reduce the size of the nodes using -t (default is 4096)";
+		return QImage();
 	}
 
 	if (createPowTwoTex) {
@@ -567,6 +568,9 @@ protected:
 
 
 void NexusBuilder::processBlock(KDTreeSoup *input, StreamSoup *output, uint block, int level) {
+	if(abort_requested.load())   // another worker already failed, abort as well
+		return;
+
 	TMesh mesh;
 	TMesh tmp; //this is needed saving a mesh with vertices on seams duplicated., and for node tex coordinates to be rearranged
 
@@ -608,9 +612,10 @@ void NexusBuilder::processBlock(KDTreeSoup *input, StreamSoup *output, uint bloc
 		}
 		tmp.splitSeams(header.signature);
 		if(tmp.vert.size() > 60000) {
-			cerr << "Unable to properly simplify due to fragmented parametrization\n"
-				 << "Try to reduce the size of the nodes using -f (default is 32768)" << endl;
-			exit(1); // TODO: or some other value
+			if(!abort_requested.exchange(true))
+				abort_message = "Unable to properly simplify due to fragmented parametrization\n"
+								"Try to reduce the size of the nodes using -f (default is 32768)";
+			return;
 		}
 
 		//save node in nexus temporary structure
@@ -631,6 +636,7 @@ void NexusBuilder::processBlock(KDTreeSoup *input, StreamSoup *output, uint bloc
 
 		if(useNodeTex) {
 			QImage nodetex = extractNodeTex(tmp, level, error, pixelXedge);
+			if(nodetex.isNull()) return;
 			tmp.serialize(buffer, header.signature, node_patches);
 
 			Texture t;
@@ -790,6 +796,9 @@ void NexusBuilder::createMeshLevel(KDTreeSoup *input, StreamSoup *output, int le
 		pool.start(worker);
 	}
 	pool.waitForDone();
+
+	if(abort_requested.load())
+		throw abort_message;
 }
 
 
